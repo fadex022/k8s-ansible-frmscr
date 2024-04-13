@@ -141,9 +141,10 @@
     - name: Set ownership of kubeconfig file
       become: no
       file:
-        path: "{{ lookup('env', 'HOME') }}/.kube/config"
-        owner: "{{ ansible_uid }}"
-        group: "{{ ansible_gid }}"
+        path: /path/to/your/kubeconfig
+        state: file
+        owner: desired_username
+        group: desired_group
         mode: 0600
 
     - name: Install Calico network plugin
