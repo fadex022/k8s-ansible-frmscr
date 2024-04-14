@@ -139,13 +139,12 @@
       command: cp /etc/kubernetes/admin.conf $HOME/.kube/config
     
     - name: Set ownership of kubeconfig file
-      become: no
       file:
-        path: /path/to/your/kubeconfig
-        state: file
-        owner: desired_username
-        group: desired_group
-        mode: 0600
+        path: $HOME/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user_gid }}"
+        mode: '0644'
+
 
     - name: Install Calico network plugin
       command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
