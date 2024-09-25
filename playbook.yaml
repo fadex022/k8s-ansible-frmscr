@@ -1,0 +1,439 @@
+---
+- name: Configure Kubernetes Master Node
+  hosts: master
+  become: yes
+  vars:
+    k8s_version: "1.31"
+    etcd_version: "v3.5.7"
+    nerdctl_version: "0.17.0"
+    cilium_cli_version: "{{ lookup('url', 'https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt') }}"
+
+  tasks:
+    - name: Set up useful alias
+      lineinfile:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        line: 'alias k="kubectl"'
+
+    - name: Install yq
+      snap:
+        name: yq
+        state: present
+
+    - name: Disable and mask apt daily services
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+        masked: yes
+      loop:
+        - apt-daily.timer
+        - apt-daily.service
+        - apt-daily-upgrade.timer
+        - apt-daily-upgrade.service
+      ignore_errors: yes
+
+    - name: Remove existing Kubernetes components
+      block:
+        - name: Remove .kube directory
+          file:
+            path: "{{ ansible_env.HOME }}/.kube"
+            state: absent
+
+        - name: Reset kubeadm
+          command: kubeadm reset -f
+          ignore_errors: yes
+
+        - name: Remove hold on Kubernetes packages
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop:
+            - kubelet
+            - kubeadm
+            - kubectl
+
+        - name: Remove Kubernetes packages
+          apt:
+            name:
+              - containerd
+              - kubelet
+              - kubeadm
+              - kubectl
+              - kubernetes-cni
+            state: absent
+            autoremove: yes
+
+    - name: Set up system configuration
+      block:
+        - name: Enable IP forwarding
+          sysctl:
+            name: net.ipv4.ip_forward
+            value: '1'
+            state: present
+
+        - name: Configure kernel parameters for Kubernetes
+          copy:
+            content: |
+              net.bridge.bridge-nf-call-ip6tables = 1
+              net.bridge.bridge-nf-call-iptables = 1
+              net.ipv4.ip_forward = 1
+            dest: /etc/sysctl.d/kubernetes.conf
+
+        - name: Apply sysctl changes
+          command: sysctl --system
+
+        - name: Load kernel modules
+          community.general.modprobe:
+            name: "{{ item }}"
+            state: present
+          loop:
+            - overlay
+            - br_netfilter
+
+    - name: Install Kubernetes packages
+      block:
+        - name: Add Kubernetes apt key
+          apt_key:
+            url: https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key
+            state: present
+
+        - name: Add Kubernetes repository
+          apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
+            state: present
+            filename: kubernetes
+
+        - name: Install Kubernetes components
+          apt:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+              - kubernetes-cni
+            state: present
+
+        - name: Hold Kubernetes packages
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubelet
+            - kubeadm
+            - kubectl
+
+    - name: Install Containerd
+      block:
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            state: present
+
+        - name: Add Docker repository
+          apt_repository:
+            repo: "deb [arch={{ ansible_architecture }}] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+            state: present
+            filename: docker
+
+        - name: Install Containerd
+          apt:
+            name: containerd.io
+            state: present
+
+        - name: Configure Containerd
+          block:
+            - name: Create Containerd config directory
+              file:
+                path: /etc/containerd
+                state: directory
+
+            - name: Generate default Containerd config
+              shell: containerd config default > /etc/containerd/config.toml
+
+            - name: Set SystemdCgroup to true
+              replace:
+                path: /etc/containerd/config.toml
+                regexp: 'SystemdCgroup = false'
+                replace: 'SystemdCgroup = true'
+
+        - name: Restart Containerd
+          systemd:
+            name: containerd
+            state: restarted
+
+    - name: Disable swap for current session
+      command: swapoff -a
+      become: true
+
+    - name: Disable swap permanently, persist reboots
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^(\s*)([^#\n]+\s+)(\w+\s+)swap(\s+.*)$'
+        line: '#\1\2\3swap\4'
+        backup: yes
+
+    - name: Install Helm
+      snap:
+        name: helm
+        classic: yes
+
+    - name: Configure crictl
+      copy:
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+        dest: /etc/crictl.yaml
+
+    - name: Install etcdctl and etcdutl
+      block:
+        - name: Download and extract etcd release
+          unarchive:
+            src: "https://github.com/etcd-io/etcd/releases/download/{{ etcd_version }}/etcd-{{ etcd_version }}-linux-{{ ansible_architecture }}.tar.gz"
+            dest: /tmp
+            remote_src: yes
+
+        - name: Move etcdctl and etcdutl to /usr/bin
+          copy:
+            src: "/tmp/etcd-{{ etcd_version }}-linux-{{ ansible_architecture }}/{{ item }}"
+            dest: /usr/bin/
+            mode: '0755'
+            remote_src: yes
+          loop:
+            - etcdctl
+            - etcdutl
+
+    - name: Install nerdctl
+      unarchive:
+        src: "https://github.com/containerd/nerdctl/releases/download/v{{ nerdctl_version }}/nerdctl-{{ nerdctl_version }}-linux-{{ ansible_architecture }}.tar.gz"
+        dest: /usr/local/bin
+        remote_src: yes
+
+    - name: Install kubectl aliases
+      block:
+        - name: Download kubectl aliases
+          get_url:
+            url: https://raw.githubusercontent.com/ahmetb/kubectl-aliases/master/.kubectl_aliases
+            dest: "{{ ansible_env.HOME }}/.kubectl_aliases"
+
+        - name: Source kubectl aliases in .bashrc
+          lineinfile:
+            path: "{{ ansible_env.HOME }}/.bashrc"
+            line: '[ -f ~/.kubectl_aliases ] && source ~/.kubectl_aliases'
+
+    - name: Initialize Kubernetes cluster
+      block:
+        - name: Pull kubeadm images
+          command: kubeadm config images pull
+
+        - name: Initialize kubeadm
+          command: kubeadm init
+          register: kubeadm_init
+
+        - name: Create .kube directory
+          file:
+            path: "{{ ansible_env.HOME }}/.kube"
+            state: directory
+
+        - name: Copy admin.conf to user's kube config
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: "{{ ansible_env.HOME }}/.kube/config"
+            remote_src: yes
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_gid }}"
+
+        - name: Set KUBECONFIG environment variable
+          lineinfile:
+            path: "{{ ansible_env.HOME }}/.bashrc"
+            line: 'export KUBECONFIG=$HOME/.kube/config'
+
+    - name: Install Cilium CLI
+      block:
+        - name: Download Cilium CLI
+          get_url:
+            url: "https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}.tar.gz"
+            dest: /tmp/cilium-cli.tar.gz
+
+        - name: Extract Cilium CLI
+          unarchive:
+            src: /tmp/cilium-cli.tar.gz
+            dest: /usr/local/bin
+            remote_src: yes
+
+    - name: Install Cilium
+      command: cilium install --version 1.16.1
+
+- name: Configure Kubernetes Worker Node
+  hosts: workers
+  become: yes
+  vars:
+    kubernetes_version: "1.31"
+  tasks:
+    - name: Install yq
+      snap:
+        name: yq
+        state: present
+
+    - name: Disable and mask apt daily services
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+        masked: yes
+      loop:
+        - apt-daily.timer
+        - apt-daily.service
+        - apt-daily-upgrade.timer
+        - apt-daily-upgrade.service
+      ignore_errors: yes
+
+    - name: Perform kubeadm reset
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Remove Kubernetes packages
+      apt:
+        name:
+          - containerd
+          - kubelet
+          - kubeadm
+          - kubectl
+          - kubernetes-cni
+        state: absent
+        autoremove: yes
+      ignore_errors: yes
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+
+    - name: Configure sysctl for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Apply sysctl changes
+      command: sysctl --system
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - curl
+        state: present
+
+    - name: Disable swap for current session
+      command: swapoff -a
+      become: true
+
+    - name: Disable swap permanently, persist reboots
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^(\s*)([^#\n]+\s+)(\w+\s+)swap(\s+.*)$'
+        line: '#\1\2\3swap\4'
+        backup: yes
+
+    - name: Add Kubernetes apt key
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key
+        state: present
+
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+          - kubernetes-cni
+        state: present
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Add Docker apt key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker apt repository
+      apt_repository:
+        repo: "deb [arch={{ ansible_architecture }}] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Generate default containerd config
+      command: containerd config default
+      register: containerd_config
+
+    - name: Write containerd config
+      copy:
+        content: "{{ containerd_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+        dest: /etc/containerd/config.toml
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Configure crictl
+      copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+
+    - name: Install nerdctl
+      vars:
+        nerdctl_version: "0.17.0"
+      block:
+        - name: Download nerdctl
+          get_url:
+            url: "https://github.com/containerd/nerdctl/releases/download/v{{ nerdctl_version }}/nerdctl-{{ nerdctl_version }}-linux-{{ ansible_architecture }}.tar.gz"
+            dest: "/tmp/nerdctl-{{ nerdctl_version }}.tar.gz"
+
+        - name: Extract nerdctl
+          unarchive:
+            src: "/tmp/nerdctl-{{ nerdctl_version }}.tar.gz"
+            dest: /usr/local/bin
+            remote_src: yes
+
+        - name: Clean up nerdctl archive
+          file:
+            path: "/tmp/nerdctl-{{ nerdctl_version }}.tar.gz"
+            state: absent
