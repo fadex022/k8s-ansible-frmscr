@@ -51,6 +51,7 @@
             - kubelet
             - kubeadm
             - kubectl
+          ignore_errors: yes
 
         - name: Remove Kubernetes packages
           apt:
@@ -62,6 +63,7 @@
               - kubernetes-cni
             state: absent
             autoremove: yes
+          ignore_errors: yes
 
     - name: Set up system configuration
       block:
@@ -96,12 +98,19 @@
           apt_key:
             url: https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key
             state: present
+            keyring: /usr/share/keyrings/kubernetes-archive-keyring.gpg
 
-        - name: Add Kubernetes repository
-          apt_repository:
-            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
+        - name: Add Kubernetes apt repository
+          # apt_repository:
+          lineinfile:
+            path: /etc/apt/sources.list.d/kubernetes.list
             state: present
-            filename: kubernetes
+            create: yes
+            line: "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
+
+        - name: Update apt cache
+          apt:
+            update_cache: yes
 
         - name: Install Kubernetes components
           apt:
@@ -123,21 +132,34 @@
 
     - name: Install Containerd
       block:
+        - name: Create /etc/apt/keyrings
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
         - name: Add Docker GPG key
           apt_key:
             url: https://download.docker.com/linux/ubuntu/gpg
             state: present
+            keyring: /etc/apt/keyrings/docker.gpg
 
         - name: Add Docker repository
           apt_repository:
-            repo: "deb [arch={{ ansible_architecture }}] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+            repo: "deb [arch={{ ansible_architecture }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
             state: present
             filename: docker
+        
+        - name: Update apt package cache
+          apt:
+            update_cache: yes
 
         - name: Install Containerd
           apt:
             name: containerd.io
             state: present
+            update_cache: yes
+            force_apt_get: yes
 
         - name: Configure Containerd
           block:
@@ -265,7 +287,7 @@
   hosts: workers
   become: yes
   vars:
-    kubernetes_version: "1.31"
+    k8s_version: "1.31"
   tasks:
     - name: Install yq
       snap:
@@ -350,12 +372,13 @@
 
     - name: Add Kubernetes apt key
       apt_key:
-        url: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key
+        url: https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key
         state: present
+        keyring: /usr/share/keyrings/kubernetes-archive-keyring.gpg
 
     - name: Add Kubernetes apt repository
       apt_repository:
-        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
         state: present
         filename: kubernetes
 
